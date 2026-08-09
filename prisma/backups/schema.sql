@@ -171,8 +171,8 @@ END;$$;
 ALTER FUNCTION "public"."create_features_layers"("_features" "json", "_srid" integer, "_project_id" "uuid", "_user_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."create_layer_with_feature"("layer_name" "text", "wkt" "text", "geom_type" "text", "project_id" "uuid", "user_id" "uuid", "elevation" numeric DEFAULT NULL::numeric, "style" "jsonb" DEFAULT '{}'::"jsonb") RETURNS TABLE("layer_id" "uuid", "feature_id" "uuid")
-    LANGUAGE "plpgsql"
+CREATE OR REPLACE FUNCTION "public"."create_layer_with_feature"("layer_name" "text", "wkt" "text", "geom_type" "text", "project_id" "uuid", "user_id" "uuid", "elevation" numeric DEFAULT NULL::numeric, "style" "jsonb" DEFAULT NULL::"jsonb", "text_content" "text" DEFAULT NULL::"text") RETURNS TABLE("layer_id" "uuid", "feature_id" "uuid")
+    LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
   new_layer_id UUID;
@@ -181,10 +181,9 @@ BEGIN
   INSERT INTO layers (name, geom_type, style, project_id, user_id)
   VALUES (layer_name, geom_type, style, project_id, user_id)
   RETURNING id INTO new_layer_id;
-
   CASE geom_type
     WHEN 'POINT' THEN
-       INSERT INTO point_features (geom, elevation, layer_id, user_id)
+      INSERT INTO point_features (geom, elevation, layer_id, user_id)
       VALUES (
         ST_GeomFromText(wkt, 4326),
         elevation,
@@ -200,16 +199,19 @@ BEGIN
       INSERT INTO polyline_features (geom, layer_id, user_id)
       VALUES (ST_GeomFromText(wkt, 4326), new_layer_id, user_id)
       RETURNING id INTO new_feature_id;
+    WHEN 'TEXT' THEN
+      INSERT INTO text_features (geom, text_content, layer_id, user_id)
+      VALUES (ST_GeomFromText(wkt, 4326), COALESCE(text_content, 'Text'), new_layer_id, user_id)
+      RETURNING id INTO new_feature_id;
     ELSE
       RAISE EXCEPTION 'Invalid geometry type: %', geom_type;
   END CASE;
-
   RETURN QUERY SELECT new_layer_id, new_feature_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."create_layer_with_feature"("layer_name" "text", "wkt" "text", "geom_type" "text", "project_id" "uuid", "user_id" "uuid", "elevation" numeric, "style" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."create_layer_with_feature"("layer_name" "text", "wkt" "text", "geom_type" "text", "project_id" "uuid", "user_id" "uuid", "elevation" numeric, "style" "jsonb", "text_content" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."create_point_edges_layer"("_project_id" "uuid", "_user_id" "uuid", "_features" "json", "_style" "json") RETURNS TABLE("layer_id" "uuid", "feature_id" "uuid")
@@ -246,24 +248,14 @@ ALTER FUNCTION "public"."create_point_edges_layer"("_project_id" "uuid", "_user_
 
 
 CREATE OR REPLACE FUNCTION "public"."delete_layer_and_features"("p_layer_id" "uuid") RETURNS "void"
-    LANGUAGE "plpgsql"
+    LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
-  -- Delete point features
-  DELETE FROM point_features
-  WHERE layer_id = p_layer_id;
-
-  -- Delete polyline features
-  DELETE FROM polyline_features
-  WHERE layer_id = p_layer_id;
-
-  -- Delete polygon features
-  DELETE FROM polygon_features
-  WHERE layer_id = p_layer_id;
-
-  -- Finally delete the layer itself
-  DELETE FROM layers
-  WHERE id = p_layer_id;
+  DELETE FROM point_features WHERE layer_id = p_layer_id;
+  DELETE FROM polyline_features WHERE layer_id = p_layer_id;
+  DELETE FROM polygon_features WHERE layer_id = p_layer_id;
+  DELETE FROM text_features WHERE layer_id = p_layer_id;
+  DELETE FROM layers WHERE id = p_layer_id;
 END;
 $$;
 
@@ -365,8 +357,9 @@ ALTER FUNCTION "public"."get_layer_by_id"("p_layer_id" "uuid") OWNER TO "postgre
 
 
 CREATE OR REPLACE FUNCTION "public"."get_project_layers_coords"("p_project_id" "uuid") RETURNS "jsonb"
-    LANGUAGE "plpgsql" IMMUTABLE
-    AS $$DECLARE
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    AS $$
+DECLARE
   _layers JSONB;
 BEGIN
   SELECT jsonb_agg(layer_obj) INTO _layers
@@ -394,7 +387,6 @@ BEGIN
               'y',          ST_Y(ST_Transform(pf.geom, l.srid)),
               'elevation',  pf.elevation,
               'updated_at', pf.updated_at
-
             )
           )
           FROM point_features pf
@@ -414,7 +406,6 @@ BEGIN
                 )
                 FROM ST_DumpPoints(pl.geom) AS dp
               ),
-              
               'length_m',    ROUND(CAST(ST_Length(pl.geom::geography) AS numeric), 2),
               'updated_at', pl.updated_at
             )
@@ -450,6 +441,24 @@ BEGIN
           WHERE pg.layer_id = l.id
         )
 
+        WHEN l.geom_type = 'TEXT' THEN (
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'id',           tf.id,
+              'coordinates', jsonb_build_array(
+                                ROUND(CAST(ST_Y(tf.geom) AS numeric), 6),
+                                ROUND(CAST(ST_X(tf.geom) AS numeric), 6)
+                              ),
+              'x',            ST_X(ST_Transform(tf.geom, l.srid)),
+              'y',            ST_Y(ST_Transform(tf.geom, l.srid)),
+              'text_content', tf.text_content,
+              'updated_at',   tf.updated_at
+            )
+          )
+          FROM text_features tf
+          WHERE tf.layer_id = l.id
+        )
+
         ELSE '[]'::JSONB
       END AS features
     FROM layers l
@@ -458,7 +467,8 @@ BEGIN
   ) AS layer_obj;
 
   RETURN COALESCE(_layers, '[]'::JSONB);
-END;$$;
+END;
+$$;
 
 
 ALTER FUNCTION "public"."get_project_layers_coords"("p_project_id" "uuid") OWNER TO "postgres";
@@ -571,70 +581,68 @@ $$;
 ALTER FUNCTION "public"."save_layer_image"("p_layer_id" "uuid", "p_image_url" "text", "p_overwrite" boolean) OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_feature_geometry"("_layer_id" "uuid", "_feature_id" "uuid", "_wkt" "text", "_elevation" numeric DEFAULT NULL::numeric) RETURNS "void"
-    LANGUAGE "plpgsql"
+CREATE OR REPLACE FUNCTION "public"."update_feature_geometry"("_layer_id" "uuid", "_feature_id" "uuid", "_wkt" "text", "_elevation" numeric DEFAULT NULL::numeric, "_text_content" "text" DEFAULT NULL::"text") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
-  _geom_type   TEXT;
+  v_geom_type TEXT;
 BEGIN
-  -- fetch layer type
-  SELECT geom_type INTO _geom_type
-    FROM layers WHERE id = _layer_id;
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'Layer % does not exist', _layer_id;
-  END IF;
+  SELECT geom_type INTO v_geom_type FROM layers WHERE id = _layer_id;
 
-  -- route update by type
-  CASE _geom_type
+  CASE v_geom_type
     WHEN 'POINT' THEN
       UPDATE point_features
-         SET geom      = ST_SetSRID(ST_GeomFromText(_wkt), 4326),
-             elevation = COALESCE(_elevation, elevation)
-       WHERE id = _feature_id AND layer_id = _layer_id;
+      SET geom = ST_GeomFromText(_wkt, 4326),
+          elevation = COALESCE(_elevation, elevation),
+          updated_at = NOW()
+      WHERE id = _feature_id AND layer_id = _layer_id;
     WHEN 'POLYGON' THEN
       UPDATE polygon_features
-         SET geom = ST_SetSRID(ST_GeomFromText(_wkt), 4326)
-       WHERE id = _feature_id AND layer_id = _layer_id;
+      SET geom = ST_GeomFromText(_wkt, 4326),
+          updated_at = NOW()
+      WHERE id = _feature_id AND layer_id = _layer_id;
     WHEN 'POLYLINE' THEN
       UPDATE polyline_features
-         SET geom = ST_SetSRID(ST_GeomFromText(_wkt), 4326)
-       WHERE id = _feature_id AND layer_id = _layer_id;
+      SET geom = ST_GeomFromText(_wkt, 4326),
+          updated_at = NOW()
+      WHERE id = _feature_id AND layer_id = _layer_id;
+    WHEN 'TEXT' THEN
+      UPDATE text_features
+      SET geom = ST_GeomFromText(_wkt, 4326),
+          text_content = COALESCE(_text_content, text_content),
+          updated_at = NOW()
+      WHERE id = _feature_id AND layer_id = _layer_id;
     ELSE
-      RAISE EXCEPTION 'Unsupported geom_type "%"', _geom_type;
+      RAISE EXCEPTION 'Invalid layer geometry type: %', v_geom_type;
   END CASE;
-
-  IF NOT FOUND THEN
-    RAISE NOTICE 'No feature % found for layer %', _feature_id, _layer_id;
-  END IF;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."update_feature_geometry"("_layer_id" "uuid", "_feature_id" "uuid", "_wkt" "text", "_elevation" numeric) OWNER TO "postgres";
+ALTER FUNCTION "public"."update_feature_geometry"("_layer_id" "uuid", "_feature_id" "uuid", "_wkt" "text", "_elevation" numeric, "_text_content" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."update_features_geometries"("p_updates" "jsonb") RETURNS "void"
-    LANGUAGE "plpgsql"
+    LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
-  rec RECORD;   -- ← must match "row" target of FOR ... IN
+  rec RECORD;
 BEGIN
   FOR rec IN
     SELECT
       (elem->>'layer_id')::uuid     AS layer_id,
       (elem->>'feature_id')::uuid    AS feature_id,
       elem->>'wkt'                   AS wkt,
-      CASE WHEN elem->>'elevation' IS NULL
-           THEN NULL
-           ELSE (elem->>'elevation')::numeric
-      END                            AS elevation
+      CASE WHEN elem->>'elevation' IS NULL THEN NULL ELSE (elem->>'elevation')::numeric END AS elevation,
+      elem->>'text_content'          AS text_content
     FROM jsonb_array_elements(p_updates) AS arr(elem)
   LOOP
     PERFORM update_feature_geometry(
       rec.layer_id,
       rec.feature_id,
       rec.wkt,
-      rec.elevation
+      rec.elevation,
+      rec.text_content
     );
   END LOOP;
 END;
@@ -692,7 +700,7 @@ CREATE TABLE IF NOT EXISTS "public"."layers" (
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "description" character varying,
     "image_url" "text"[],
-    CONSTRAINT "layers_geom_type_check" CHECK (("geom_type" = ANY (ARRAY['POINT'::"text", 'POLYGON'::"text", 'POLYLINE'::"text"])))
+    CONSTRAINT "layers_geom_type_check" CHECK (("geom_type" = ANY (ARRAY['POINT'::"text", 'POLYGON'::"text", 'POLYLINE'::"text", 'TEXT'::"text"])))
 );
 
 
@@ -751,6 +759,20 @@ CREATE TABLE IF NOT EXISTS "public"."projects" (
 ALTER TABLE "public"."projects" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."text_features" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "layer_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "geom" "extensions"."geometry"(Point,4326) NOT NULL,
+    "text_content" "text" DEFAULT ''::"text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."text_features" OWNER TO "postgres";
+
+
 ALTER TABLE ONLY "public"."audit_logs"
     ADD CONSTRAINT "audit_logs_pkey" PRIMARY KEY ("id");
 
@@ -778,6 +800,11 @@ ALTER TABLE ONLY "public"."polyline_features"
 
 ALTER TABLE ONLY "public"."projects"
     ADD CONSTRAINT "projects_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."text_features"
+    ADD CONSTRAINT "text_features_pkey" PRIMARY KEY ("id");
 
 
 
@@ -911,6 +938,11 @@ ALTER TABLE ONLY "public"."projects"
 
 
 
+ALTER TABLE ONLY "public"."text_features"
+    ADD CONSTRAINT "text_features_layer_id_fkey" FOREIGN KEY ("layer_id") REFERENCES "public"."layers"("id") ON DELETE CASCADE;
+
+
+
 CREATE POLICY "Allow audit log writes" ON "public"."audit_logs" FOR INSERT WITH CHECK (true);
 
 
@@ -945,6 +977,22 @@ CREATE POLICY "User can manage their projects" ON "public"."projects" USING (("u
 
 
 
+CREATE POLICY "Users can delete own text features" ON "public"."text_features" FOR DELETE USING (("auth"."uid"() = "user_id"));
+
+
+
+CREATE POLICY "Users can insert own text features" ON "public"."text_features" FOR INSERT WITH CHECK (("auth"."uid"() = "user_id"));
+
+
+
+CREATE POLICY "Users can update own text features" ON "public"."text_features" FOR UPDATE USING (("auth"."uid"() = "user_id"));
+
+
+
+CREATE POLICY "Users can view own text features" ON "public"."text_features" FOR SELECT USING (("auth"."uid"() = "user_id"));
+
+
+
 ALTER TABLE "public"."audit_logs" ENABLE ROW LEVEL SECURITY;
 
 
@@ -961,6 +1009,9 @@ ALTER TABLE "public"."polyline_features" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."projects" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."text_features" ENABLE ROW LEVEL SECURITY;
 
 
 
@@ -3315,9 +3366,9 @@ GRANT ALL ON FUNCTION "public"."create_features_layers"("_features" "json", "_sr
 
 
 
-GRANT ALL ON FUNCTION "public"."create_layer_with_feature"("layer_name" "text", "wkt" "text", "geom_type" "text", "project_id" "uuid", "user_id" "uuid", "elevation" numeric, "style" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."create_layer_with_feature"("layer_name" "text", "wkt" "text", "geom_type" "text", "project_id" "uuid", "user_id" "uuid", "elevation" numeric, "style" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."create_layer_with_feature"("layer_name" "text", "wkt" "text", "geom_type" "text", "project_id" "uuid", "user_id" "uuid", "elevation" numeric, "style" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."create_layer_with_feature"("layer_name" "text", "wkt" "text", "geom_type" "text", "project_id" "uuid", "user_id" "uuid", "elevation" numeric, "style" "jsonb", "text_content" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."create_layer_with_feature"("layer_name" "text", "wkt" "text", "geom_type" "text", "project_id" "uuid", "user_id" "uuid", "elevation" numeric, "style" "jsonb", "text_content" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_layer_with_feature"("layer_name" "text", "wkt" "text", "geom_type" "text", "project_id" "uuid", "user_id" "uuid", "elevation" numeric, "style" "jsonb", "text_content" "text") TO "service_role";
 
 
 
@@ -3363,9 +3414,9 @@ GRANT ALL ON FUNCTION "public"."save_layer_image"("p_layer_id" "uuid", "p_image_
 
 
 
-GRANT ALL ON FUNCTION "public"."update_feature_geometry"("_layer_id" "uuid", "_feature_id" "uuid", "_wkt" "text", "_elevation" numeric) TO "anon";
-GRANT ALL ON FUNCTION "public"."update_feature_geometry"("_layer_id" "uuid", "_feature_id" "uuid", "_wkt" "text", "_elevation" numeric) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_feature_geometry"("_layer_id" "uuid", "_feature_id" "uuid", "_wkt" "text", "_elevation" numeric) TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_feature_geometry"("_layer_id" "uuid", "_feature_id" "uuid", "_wkt" "text", "_elevation" numeric, "_text_content" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_feature_geometry"("_layer_id" "uuid", "_feature_id" "uuid", "_wkt" "text", "_elevation" numeric, "_text_content" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_feature_geometry"("_layer_id" "uuid", "_feature_id" "uuid", "_wkt" "text", "_elevation" numeric, "_text_content" "text") TO "service_role";
 
 
 
@@ -3501,6 +3552,12 @@ GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE "public".
 GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE "public"."projects" TO "anon";
 GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE "public"."projects" TO "authenticated";
 GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE "public"."projects" TO "service_role";
+
+
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE "public"."text_features" TO "anon";
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE "public"."text_features" TO "authenticated";
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE "public"."text_features" TO "service_role";
 
 
 
