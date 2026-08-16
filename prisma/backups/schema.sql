@@ -283,6 +283,19 @@ $$;
 ALTER FUNCTION "public"."delete_layer_images"("p_layer_id" "uuid", "p_image_url" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."delete_user"() RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+begin
+  delete from auth.users where id = auth.uid();
+end;
+$$;
+
+
+ALTER FUNCTION "public"."delete_user"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."get_layer_by_id"("p_layer_id" "uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql"
     AS $$
@@ -889,7 +902,7 @@ CREATE OR REPLACE TRIGGER "update_projects_modtime" BEFORE UPDATE ON "public"."p
 
 
 ALTER TABLE ONLY "public"."audit_logs"
-    ADD CONSTRAINT "audit_logs_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id");
+    ADD CONSTRAINT "audit_logs_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -899,7 +912,7 @@ ALTER TABLE ONLY "public"."layers"
 
 
 ALTER TABLE ONLY "public"."layers"
-    ADD CONSTRAINT "layers_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id");
+    ADD CONSTRAINT "layers_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -909,7 +922,7 @@ ALTER TABLE ONLY "public"."point_features"
 
 
 ALTER TABLE ONLY "public"."point_features"
-    ADD CONSTRAINT "point_features_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id");
+    ADD CONSTRAINT "point_features_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -919,7 +932,7 @@ ALTER TABLE ONLY "public"."polygon_features"
 
 
 ALTER TABLE ONLY "public"."polygon_features"
-    ADD CONSTRAINT "polygon_features_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id");
+    ADD CONSTRAINT "polygon_features_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -929,17 +942,22 @@ ALTER TABLE ONLY "public"."polyline_features"
 
 
 ALTER TABLE ONLY "public"."polyline_features"
-    ADD CONSTRAINT "polyline_features_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id");
+    ADD CONSTRAINT "polyline_features_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."projects"
-    ADD CONSTRAINT "projects_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id");
+    ADD CONSTRAINT "projects_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."text_features"
     ADD CONSTRAINT "text_features_layer_id_fkey" FOREIGN KEY ("layer_id") REFERENCES "public"."layers"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."text_features"
+    ADD CONSTRAINT "text_features_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -3387,6 +3405,12 @@ GRANT ALL ON FUNCTION "public"."delete_layer_and_features"("p_layer_id" "uuid") 
 GRANT ALL ON FUNCTION "public"."delete_layer_images"("p_layer_id" "uuid", "p_image_url" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."delete_layer_images"("p_layer_id" "uuid", "p_image_url" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."delete_layer_images"("p_layer_id" "uuid", "p_image_url" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."delete_user"() TO "anon";
+GRANT ALL ON FUNCTION "public"."delete_user"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_user"() TO "service_role";
 
 
 
